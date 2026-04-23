@@ -5,10 +5,6 @@
 #   python Scripts/server.py                   # default port 7890
 #   python Scripts/server.py --port 8000
 #   python Scripts/server.py --host 0.0.0.0 --port 7890
-#
-# The server runs a full game simulation (same Player/Arena/etc objects).
-# Clients send inputs; server applies them, steps physics, broadcasts state.
-# Server tick rate: 60 Hz simulation, 20 Hz state broadcast.
 
 import asyncio
 import json
@@ -26,12 +22,9 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 # ── Headless pygame stub (server has no display) ──────────────────────────────
-# Must happen before any game module imports that touch pygame
 try:
     import pygame
 except ImportError:
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
     import pygame_stub as pygame
     sys.modules["pygame"] = pygame
     sys.modules["pygame.font"]      = pygame.font
@@ -46,7 +39,7 @@ from websockets.server import serve
 
 from network import (msg, unpack, pack_state,
                      serialise_player, serialise_projectile, serialise_effect,
-                     DEFAULT_PORT, DEFAULT_HOST)
+                     DEFAULT_PORT)
 from constants import *
 
 logging.basicConfig(
@@ -56,15 +49,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("server")
 
-
-# ── Server config ─────────────────────────────────────────────────────────────
-SIM_HZ        = 60     # physics ticks per second
-BROADCAST_HZ  = 20     # state sends per second
+SIM_HZ        = 60
+BROADCAST_HZ  = 20
 MAX_PLAYERS   = 8
-LOBBY_TIMEOUT = 120.0  # seconds to wait for players before auto-start
+LOBBY_TIMEOUT = 120.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 class ClientConn:
     def __init__(self, ws, pid):
         self.ws          = ws
@@ -88,38 +78,28 @@ class ClientConn:
         await self.send(msg(**kwargs))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 class GameServer:
 
-    # Server states
     ST_LOBBY   = "lobby"
     ST_PLAYING = "playing"
-    ST_AON     = "aon"        # All or Nothing phase
+    ST_AON     = "aon"
 
     def __init__(self):
-        self.clients:  dict[int, ClientConn] = {}   # pid → ClientConn
+        self.clients:  dict[int, ClientConn] = {}
         self._next_pid = 0
         self.state     = self.ST_LOBBY
-
-        # Game objects (created on match start)
         self.players    = []
         self.cpus       = []
         self.arena      = None
         self.projectiles = []
         self.effects    = []
-
         self.round_num  = 1
         self.round_time = 0.0
         self._tick      = 0
         self._broadcast_acc = 0.0
-
-        # AON state
-        self._aon_decisions = {}   # pid → {"decision":..., "pick":...}
-        self._aon_results   = {}   # pid → result dict
-
+        self._aon_decisions = {}
+        self._aon_results   = {}
         log.info("Server initialised")
-
-    # ── Connection management ─────────────────────────────────────────────────
 
     async def register(self, ws) -> ClientConn | None:
         if len(self.clients) >= MAX_PLAYERS:
@@ -134,13 +114,10 @@ class GameServer:
         client = ClientConn(ws, pid)
         self.clients[pid] = client
 
-        # Welcome the new player
         existing = [{"id": c.pid, "name": c.name,
                      "element": c.element, "wand": c.wand}
                     for c in self.clients.values() if c.pid != pid]
         await client.send_obj(type="welcome", your_id=pid, players=existing)
-
-        # Notify others
         await self._broadcast(msg(type="player_join", id=pid,
                                   name=client.name,
                                   element=client.element,
@@ -154,13 +131,9 @@ class GameServer:
             del self.clients[pid]
             await self._broadcast(msg(type="player_leave", id=pid))
             log.info(f"Player {pid} disconnected  ({len(self.clients)} remaining)")
-
-            # If playing and not enough players, handle gracefully
             if self.state == self.ST_PLAYING and len(self.clients) < 1:
                 log.info("All players disconnected — resetting")
                 self._reset()
-
-    # ── Message handling ──────────────────────────────────────────────────────
 
     async def handle_message(self, client: ClientConn, raw: str):
         m = unpack(raw)
@@ -175,34 +148,27 @@ class GameServer:
                                       name=client.name,
                                       element=client.element,
                                       wand=client.wand))
-
         elif t == "ready":
             client.ready = True
             await self._broadcast(msg(type="player_ready", id=client.pid))
             log.info(f"P{client.pid} ready  "
                      f"({sum(1 for c in self.clients.values() if c.ready)}/{len(self.clients)} ready)")
             await self._check_start()
-
         elif t == "input":
             if m.get("seq", -1) > client.last_seq:
                 client.last_seq   = m["seq"]
                 client.last_input = m
-
         elif t == "aon_decision":
             self._aon_decisions[client.pid] = {
                 "decision": m.get("decision", "hold"),
                 "pick":     m.get("pick"),
             }
             await self._check_aon_complete()
-
         elif t == "ping":
             await client.send_obj(type="pong", t=m.get("t", 0))
-
         elif t == "chat":
             text = str(m.get("text", ""))[:120]
             await self._broadcast(msg(type="chat", pid=client.pid, text=text))
-
-    # ── Start match ───────────────────────────────────────────────────────────
 
     async def _check_start(self):
         ready = [c for c in self.clients.values() if c.ready]
@@ -210,14 +176,12 @@ class GameServer:
         if total >= 2 and len(ready) == total:
             await self._start_match()
         elif total == 1 and len(ready) == 1:
-            # Solo test: start with 1 player + CPUs
             await self._start_match()
 
     async def _start_match(self):
         self.state = self.ST_PLAYING
         log.info(f"Starting match with {len(self.clients)} human player(s)")
 
-        # Build player list: human clients first, then fill with CPUs to reach 4
         from player import Player
         from ai import CPUController
         from arena import Arena, MAPS_DIR
@@ -227,7 +191,6 @@ class GameServer:
             player_configs.append({"pid": c.pid, "element": c.element,
                                    "wand": c.wand, "name": c.name, "is_cpu": False})
 
-        # Fill to at least 2 players with CPUs
         cpu_pids = []
         while len(player_configs) < 2:
             cpid = self._next_pid
@@ -238,7 +201,6 @@ class GameServer:
                                    "name": f"CPU{cpid}", "is_cpu": True})
             cpu_pids.append(cpid)
 
-        # Load arena
         import json as _json
         maps = [f for f in os.listdir(MAPS_DIR) if f.endswith(".json")]
         map_name = random.choice(maps) if maps else None
@@ -249,14 +211,12 @@ class GameServer:
             map_data = self._default_map()
         self.arena = Arena(map_data)
 
-        # Create player objects
         self.players = []
         for cfg in player_configs:
             sx, sy = self.arena.get_spawn(cfg["pid"] % 8)
             p = Player(sx, sy, cfg["pid"], cfg["element"], cfg["wand"])
             self.players.append(p)
 
-        # CPU controllers
         self.cpus = [CPUController(p, "medium")
                      for p in self.players
                      if p.player_id in cpu_pids]
@@ -266,7 +226,6 @@ class GameServer:
         self.round_num   = 1
         self.round_time  = 0.0
 
-        # Tell all clients to start
         await self._broadcast(msg(
             type="start_match",
             players=[{"id": cfg["pid"], "element": cfg["element"],
@@ -277,26 +236,19 @@ class GameServer:
         ))
         log.info("Match started")
 
-    # ── Simulation loop (called externally at SIM_HZ) ─────────────────────────
-
     def tick(self, dt: float):
-        if self.state != self.ST_PLAYING:
-            return
-        if not self.arena:
+        if self.state != self.ST_PLAYING or not self.arena:
             return
 
         self._tick      += 1
         self.round_time += dt
 
-        # Apply inputs from human clients
         from spells import Projectile
         for pid, client in list(self.clients.items()):
             inp = client.last_input
-            if not inp:
-                continue
+            if not inp: continue
             player = self._player_by_id(pid)
-            if not player or not player.alive:
-                continue
+            if not player or not player.alive: continue
 
             if inp.get("left"):   player.move_left()
             if inp.get("right"):  player.move_right()
@@ -308,29 +260,24 @@ class GameServer:
                 projs = player.try_cast(slot, ax, ay, self.effects)
                 self.projectiles.extend(projs)
 
-        # CPU controllers
         for cpu in self.cpus:
             cpu.update(dt, self.players, self.projectiles,
                        self.arena.platforms, self.arena.safe_rect, self.effects)
 
-        # Physics
         self.arena.update(dt, self.round_time)
         for p in self.players:
             p.update(dt, self.arena.platforms, self.arena.safe_rect)
 
-        # OOB damage
         for p in self.players:
             if p.alive and not self.arena.is_in_safe_zone(p.x, p.y):
                 p.take_damage(OOB_DAMAGE * dt)
 
-        # Hazard tiles
         for p in self.players:
             if not p.alive: continue
             for plat in self.arena.platforms:
                 if plat.dps > 0 and plat.rect.colliderect(p.feet):
                     p.take_damage(plat.dps * dt)
 
-        # Projectile updates + collisions
         from spells import WallEntity, DashEffect, TrapEntity, AoeEffect, BuffEffect, PullZone
         new_projs = []
         for proj in self.projectiles:
@@ -365,7 +312,6 @@ class GameServer:
                         break
         self.projectiles = [p for p in self.projectiles if p.alive] + new_projs
 
-        # Effects
         wall_spikes = []
         for eff in self.effects:
             if not eff.alive: continue
@@ -418,8 +364,6 @@ class GameServer:
             chain_count=proj.chain_count-1, chain_range=cr)
         return [np]
 
-    # ── Round end / AON ───────────────────────────────────────────────────────
-
     async def check_round_end(self):
         if self.state != self.ST_PLAYING: return
         alive = [p for p in self.players if p.alive]
@@ -435,7 +379,6 @@ class GameServer:
                                   winner_id=wid,
                                   round_num=self.round_num))
 
-        # Check match winner
         for p in self.players:
             if p.round_wins >= ROUNDS_TO_WIN:
                 await self._broadcast(msg(type="match_over",
@@ -445,7 +388,6 @@ class GameServer:
                 self._reset()
                 return
 
-        # Start AON phase
         await self._start_aon(wid)
 
     async def _start_aon(self, winner_id):
@@ -454,7 +396,6 @@ class GameServer:
         self._aon_results.clear()
 
         from upgrade_screen import WINNER_CARDS, LOSER_CARDS
-        from network import msg as nmsg
 
         slots = []
         for p in self.players:
@@ -466,9 +407,7 @@ class GameServer:
                           "cards": cards,
                           "is_winner": p.player_id == winner_id})
 
-        # Store cards per player for resolution
         self._aon_slots = {s["pid"]: s for s in slots}
-
         await self._broadcast(msg(type="aon_start",
                                   round_winner=winner_id,
                                   slots=slots))
@@ -480,7 +419,6 @@ class GameServer:
         if not human_pids.issubset(decided):
             return
 
-        # Resolve CPU AON automatically
         for p in self.players:
             if p.player_id not in self.clients:
                 ex = len(p.upgrades)
@@ -490,7 +428,6 @@ class GameServer:
                     "pick":     random.choice(["heads","tails"]) if wager else None
                 }
 
-        # Resolve all
         results = {}
         for p in self.players:
             pid  = p.player_id
@@ -503,7 +440,7 @@ class GameServer:
                 for upg in cards:
                     p.apply_upgrade(upg)
             else:
-                coin = random.random() < 0.5   # True = heads
+                coin = random.random() < 0.5
                 pick_heads = (dec.get("pick") == "heads")
                 won  = (pick_heads == coin)
                 if won:
@@ -533,14 +470,13 @@ class GameServer:
         self.projectiles.clear()
         self.effects.clear()
         if self.arena:
-            self.arena.safe_rect  = __import__('pygame').Rect(
-                0,0, self.arena.width, self.arena.height)
+            # Use the already-imported pygame (real or stub)
+            import pygame as _pg
+            self.arena.safe_rect  = _pg.Rect(0, 0, self.arena.width, self.arena.height)
             self.arena._shrinking = False
         for i, p in enumerate(self.players):
             sx, sy = self.arena.get_spawn(i)
             p.reset_for_round(sx, sy)
-
-    # ── State broadcast ───────────────────────────────────────────────────────
 
     async def broadcast_state(self):
         if self.state != self.ST_PLAYING: return
@@ -549,8 +485,6 @@ class GameServer:
         ef = [serialise_effect(e) for e in self.effects[:32]]
         payload = pack_state(self._tick, self._tick, ps, pr, ef)
         await self._broadcast(payload)
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _broadcast(self, data: str, exclude: int = -1):
         dead = []
@@ -594,8 +528,6 @@ class GameServer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Async main
-# ─────────────────────────────────────────────────────────────────────────────
 
 server = GameServer()
 
@@ -614,7 +546,6 @@ async def handle_client(ws):
 
 
 async def sim_loop():
-    """Run game simulation at SIM_HZ and broadcast at BROADCAST_HZ."""
     dt          = 1.0 / SIM_HZ
     bc_interval = 1.0 / BROADCAST_HZ
     acc         = 0.0
@@ -633,7 +564,6 @@ async def sim_loop():
             acc -= bc_interval
             await server.broadcast_state()
 
-        # Sleep for remainder of tick
         elapsed = time.monotonic() - now
         sleep   = max(0.0, dt - elapsed)
         await asyncio.sleep(sleep)
@@ -641,17 +571,21 @@ async def sim_loop():
 
 async def main_async(host, port):
     log.info(f"Starting Wand & Wager server on {host}:{port}")
-    log.info(f"Players can connect to  ws://<your-ip>:{port}")
     async with serve(handle_client, host, port):
         await sim_loop()
 
 
 def main():
+    # Railway requires 0.0.0.0 and reads port from the PORT env var
+    default_host = os.environ.get("HOST", "0.0.0.0")
+    default_port = int(os.environ.get("PORT", DEFAULT_PORT))
+
     parser = argparse.ArgumentParser(description="Wand & Wager server")
-    parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--port", type=int,
-                        default=int(os.environ.get("PORT", DEFAULT_PORT)))
+    parser.add_argument("--host", default=default_host)
+    parser.add_argument("--port", type=int, default=default_port)
     args = parser.parse_args()
+
+    log.info(f"Binding to {args.host}:{args.port}")
     try:
         asyncio.run(main_async(args.host, args.port))
     except KeyboardInterrupt:
