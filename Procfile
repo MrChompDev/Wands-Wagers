@@ -1,1 +1,1 @@
-web: python Scripts/server.py
+web: cd Scripts && python server.py
