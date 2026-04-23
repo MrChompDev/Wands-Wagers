@@ -30,6 +30,8 @@ if _HERE not in sys.path:
 try:
     import pygame
 except ImportError:
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
     import pygame_stub as pygame
     sys.modules["pygame"] = pygame
     sys.modules["pygame.font"]      = pygame.font
